@@ -10,10 +10,13 @@ export class AccessDeniedError extends Error {
   }
 }
 
-/** Thrown when the server's Microsoft connection needs re-consent by the owner. */
+/**
+ * The server's app registration has lost access — an expired client secret or
+ * withdrawn admin consent. Retrying will not help; an admin has to act.
+ */
 export class ReauthRequiredError extends Error {
   constructor() {
-    super('The Excel connection needs to be reauthorised by the workbook owner.');
+    super("The Excel connection has lost access. Scans are safe — ask IT to check the app registration.");
     this.name = 'ReauthRequiredError';
   }
 }

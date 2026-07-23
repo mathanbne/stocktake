@@ -15,17 +15,35 @@ This is the only shape that works for a browser-launched scanner. Anything a Vit
 
 So the app scans entirely against its local IndexedDB copy and only contacts `/api/excel` when there is connectivity. Devices are gated by a short access code, typed once on the Start screen and stored locally; it never affects offline scanning.
 
-Two auth modes, chosen by whether `MS_TENANT_ID` is set:
+Auth is **app-only** (client credentials) against a work/school tenant. The app registration is itself the identity: no user signs in, there is no refresh token to rotate, and nothing breaks when a person leaves or changes their password.
 
-| | Personal OneDrive (`outlook.com`) | Work / school M365 |
-|---|---|---|
-| Grant | Delegated + stored refresh token | Client credentials (app-only) |
-| Permission | `Files.ReadWrite` `offline_access` | `Files.ReadWrite.All` + admin consent |
-| Extra setup | One-time consent, KV for token rotation | None |
+### Entra app registration
 
-App-only auth is not available for consumer OneDrive, which is why the personal path needs the delegated flow. Microsoft rotates personal refresh tokens on every use, so the current one is kept in KV and rewritten on each refresh — a Vercel env var can't work, because env vars aren't writable at runtime.
+1. Entra admin centre → App registrations → New registration. Supported account types: **this organizational directory only**. No redirect URI is needed — there is no browser sign-in.
+2. Certificates & secrets → New client secret. Note the expiry; the app returns a distinct "lost access" error when it lapses, but a calendar reminder is cheaper.
+3. API permissions → Microsoft Graph → **Application** permissions → then see below.
+4. Grant admin consent.
 
-**If a work M365 account is an option, put the workbook there.** It removes the consent flow and the KV dependency entirely.
+**On permissions:** `Files.ReadWrite.All` grants read/write to *every* file in the tenant, and an admin is right to push back on that. Prefer least privilege:
+
+- **Workbook in a SharePoint / Teams document library** → use **`Sites.Selected`**, then have an admin grant this one app write access to that one site. This is the recommended setup; if the workbook is currently in someone's OneDrive, moving it to a Teams site is worth doing for this reason alone.
+- **Workbook in OneDrive for Business** → `Files.ReadWrite.All` is the only option, since `Sites.Selected` doesn't cover personal drives.
+
+### Finding the two ids
+
+App-only tokens have no `/me`, so the drive must be named explicitly. Run these in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer) while signed in as yourself:
+
+```http
+# SharePoint / Teams library
+GET /sites/{hostname}:/sites/{site-name}
+GET /sites/{site-id}/drives                       → EXCEL_DRIVE_ID
+
+# OneDrive for Business
+GET /me/drive                                     → EXCEL_DRIVE_ID
+
+# then, either way
+GET /drives/{drive-id}/root/search(q='stock.xlsx') → EXCEL_ITEM_ID
+```
 
 ## Excel workbook structure
 
@@ -99,9 +117,8 @@ To exercise `/api/excel` locally you need `vercel dev` (plain `vite` does not ru
 
 1. Push to a **private** GitHub repo. `.gitignore` already excludes `node_modules/`, `dist/`, and every `.env` except the example.
 2. Import the repo in Vercel — the Vite preset is detected automatically, and `api/*.ts` becomes Node functions with no extra config.
-3. Set the server env vars from `.env.example` for **Production and Preview**.
-4. Personal-OneDrive path only: provision Upstash Redis from the Vercel Marketplace (it supplies `KV_REST_API_URL` / `KV_REST_API_TOKEN`), register `https://<your-app>.vercel.app/api/auth/callback` as a redirect URI in the Entra app, then visit `/api/auth/start?code=<STOCKTAKE_ACCESS_CODE>` once from a laptop.
-5. Vercel serves HTTPS by default — mandatory, since both the camera and the service worker require it.
+3. Set the server env vars from `.env.example` for **Production and Preview**: `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `EXCEL_DRIVE_ID`, `EXCEL_ITEM_ID`, `STOCKTAKE_ACCESS_CODE`.
+4. Vercel serves HTTPS by default — mandatory, since both the camera and the service worker require it.
 
 `vercel.json` keeps `sw.js` and the manifest revalidating so `registerType: 'autoUpdate'` actually picks up new deploys; hashed assets keep Vercel's immutable caching.
 
@@ -160,7 +177,7 @@ Every scan carries a client-generated `Scan ID`. `submitScans` reads the existin
 - [ ] Deny camera permission → manual entry still works end to end.
 
 **Security**
-- [ ] `grep -rniE "client_secret|MS_CLIENT|KV_REST" dist/` returns nothing.
+- [ ] `grep -rniE "client_secret|MS_CLIENT|MS_TENANT|EXCEL_DRIVE" dist/` returns nothing.
 - [ ] A request to `/api/excel` without a valid `x-stocktake-code` header returns 401.
 
 **Installability**
