@@ -15,3 +15,7 @@ npm-debug.log*
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Debug screenshots
+*.jpg
+*.jpeg
