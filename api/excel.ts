@@ -14,7 +14,10 @@ import {
   workbookBase,
   type BatchRequest,
   type GraphCtx,
-} from './_graph';
+  // Explicit .js extension: package.json sets "type": "module", so Node's ESM
+  // loader resolves this at runtime and an extensionless specifier fails the
+  // whole module load — before the handler runs, which surfaces as a bare 500.
+} from './_graph.js';
 
 const REGISTER_TABLE = 'AssetRegister';
 const SCANLOG_TABLE = 'ScanLog';

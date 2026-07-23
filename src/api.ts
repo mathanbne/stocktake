@@ -31,15 +31,29 @@ async function callApi<T>(body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
 
+  // Read as text first. A crashed function returns Vercel's HTML error page, not
+  // JSON, and blindly calling .json() would swallow the only clue we have.
+  const raw = await res.text();
+  let parsed: { error?: string } = {};
+  try {
+    parsed = raw ? JSON.parse(raw) : {};
+  } catch {
+    parsed = {};
+  }
+
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({}) as { error?: string });
-    if (res.status === 401 && detail.error === 'reauth_required') throw new ReauthRequiredError();
+    if (res.status === 401 && parsed.error === 'reauth_required') throw new ReauthRequiredError();
     if (res.status === 401 || res.status === 403) {
       throw new AccessDeniedError('Access code rejected. Check the code and try again.');
     }
-    throw new Error(detail.error ? `${res.status}: ${detail.error}` : `Server returned ${res.status}`);
+    const detail =
+      parsed.error ??
+      (raw.trim() === ''
+        ? 'empty response — the function crashed. Check the Vercel function logs.'
+        : `${raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)}`);
+    throw new Error(`${res.status}: ${detail}`);
   }
-  return (await res.json()) as T;
+  return parsed as T;
 }
 
 function str(v: unknown): string {
