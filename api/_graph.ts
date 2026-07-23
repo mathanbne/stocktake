@@ -3,14 +3,33 @@
  * credential, never signs in, and never learns the workbook's identity — it only
  * knows about /api/excel.
  *
- * Auth is app-only (client credentials): the app registration *is* the identity,
- * so there is no user, no refresh token, and nothing to re-consent when a person
- * leaves. This is only available on a work/school tenant.
+ * Auth is **delegated**: the app acts as you. You sign in once from a laptop at
+ * /api/auth/start, and the resulting refresh token is stored server-side and used
+ * from then on. Nothing is granted that you couldn't already open yourself, which
+ * is why this needs no admin consent — unlike app-only auth, which would give the
+ * app its own tenant-wide identity.
+ *
+ * Consequence worth knowing: every write lands in the workbook's version history
+ * under *your* name, and the connection dies if your account is disabled or your
+ * password is reset.
  */
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 
-/** The app registration's access has broken — an admin has to fix it, not a scanner. */
+/**
+ * Delegated Files.ReadWrite.All reaches both OneDrive for Business and any
+ * SharePoint library you can already open, and — unlike its application-level
+ * namesake — does not require admin consent. offline_access is what makes the
+ * refresh token possible.
+ */
+export const SCOPES = 'Files.ReadWrite.All offline_access';
+
+/** `organizations` accepts any work/school account without pinning a tenant id. */
+export function authority(): string {
+  return process.env.MS_TENANT_ID || 'organizations';
+}
+
+/** The stored sign-in has broken — someone has to sign in again at /api/auth/start. */
 export class ReauthRequired extends Error {
   constructor(detail: string) {
     super(detail);
@@ -25,42 +44,82 @@ export class ConfigError extends Error {
   }
 }
 
-function required(name: string): string {
+export function required(name: string): string {
   const v = process.env[name];
   if (!v) throw new ConfigError(`Missing environment variable ${name}`);
   return v;
 }
 
-// ---- access token ----
+// ---- refresh-token store ----
+
+const KV_KEY = 'stocktake:ms_refresh_token';
+
+async function kv(command: unknown[]): Promise<{ result: string | null }> {
+  const res = await fetch(required('KV_REST_API_URL'), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${required('KV_REST_API_TOKEN')}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(command),
+  });
+  if (!res.ok) throw new Error(`KV ${res.status}: ${await res.text()}`);
+  return (await res.json()) as { result: string | null };
+}
+
+export async function readRefreshToken(): Promise<string | null> {
+  return (await kv(['GET', KV_KEY])).result;
+}
+
+export async function writeRefreshToken(token: string): Promise<void> {
+  await kv(['SET', KV_KEY, token]);
+}
+
+// ---- access tokens ----
 
 /** Warm-instance cache. Saves a token round trip on most invocations. */
 let cached: { token: string; expiresAt: number } | null = null;
 
-export async function getAccessToken(): Promise<string> {
-  if (cached && Date.now() < cached.expiresAt) return cached.token;
-
-  const tenant = required('MS_TENANT_ID');
-  const res = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
+export async function requestToken(form: Record<string, string>): Promise<{
+  access_token: string;
+  expires_in: number;
+  refresh_token?: string;
+}> {
+  const res = await fetch(`https://login.microsoftonline.com/${authority()}/oauth2/v2.0/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: required('MS_CLIENT_ID'),
-      client_secret: required('MS_CLIENT_SECRET'),
-      grant_type: 'client_credentials',
-      scope: 'https://graph.microsoft.com/.default',
-    }).toString(),
+    body: new URLSearchParams(form).toString(),
   });
-
   const body = (await res.json()) as Record<string, unknown>;
   if (!res.ok) {
     const detail = `${body.error ?? res.status}: ${body.error_description ?? 'token request failed'}`;
-    // An expired client secret or withdrawn admin consent is an operational
-    // problem, not a transient one — flag it distinctly so the app can say so.
+    // A dead refresh token needs a human to sign in again — never a retry.
     if (res.status === 400 || res.status === 401) throw new ReauthRequired(detail);
     throw new Error(detail);
   }
+  return body as unknown as { access_token: string; expires_in: number; refresh_token?: string };
+}
 
-  const token = body as unknown as { access_token: string; expires_in: number };
+export async function getAccessToken(): Promise<string> {
+  if (cached && Date.now() < cached.expiresAt) return cached.token;
+
+  const refresh = await readRefreshToken();
+  if (!refresh) {
+    throw new ReauthRequired('Nobody has signed in yet. Visit /api/auth/start to connect Excel.');
+  }
+
+  const token = await requestToken({
+    client_id: required('MS_CLIENT_ID'),
+    client_secret: required('MS_CLIENT_SECRET'),
+    grant_type: 'refresh_token',
+    refresh_token: refresh,
+    scope: SCOPES,
+  });
+
+  // Entra rotates the refresh token on redemption; persisting the new one is
+  // mandatory, or the next cold start is locked out.
+  if (token.refresh_token) await writeRefreshToken(token.refresh_token);
+
   cached = {
     token: token.access_token,
     expiresAt: Date.now() + Math.max(0, token.expires_in - 300) * 1000,
@@ -71,11 +130,13 @@ export async function getAccessToken(): Promise<string> {
 // ---- Graph plumbing ----
 
 /**
- * App-only tokens have no `/me`, so the drive must be named explicitly.
- * See the README for the two Graph queries that produce these two ids.
+ * `/me/drive` is the signed-in user's OneDrive for Business. Set EXCEL_DRIVE_ID
+ * instead when the workbook lives in a SharePoint or Teams document library.
  */
 export function workbookBase(): string {
-  return `/drives/${required('EXCEL_DRIVE_ID')}/items/${required('EXCEL_ITEM_ID')}`;
+  const item = required('EXCEL_ITEM_ID');
+  const drive = process.env.EXCEL_DRIVE_ID;
+  return drive ? `/drives/${drive}/items/${item}` : `/me/drive/items/${item}`;
 }
 
 export interface GraphCtx {
@@ -101,9 +162,7 @@ export async function graph<T>(
   });
   if (!res.ok) {
     const text = await res.text();
-    if (res.status === 401 || res.status === 403) {
-      throw new ReauthRequired(`Graph refused the app registration: ${text}`);
-    }
+    if (res.status === 401) throw new ReauthRequired(`Graph rejected the token: ${text}`);
     throw new Error(`Graph ${res.status} on ${path}: ${text}`);
   }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);

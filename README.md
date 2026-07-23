@@ -15,35 +15,45 @@ This is the only shape that works for a browser-launched scanner. Anything a Vit
 
 So the app scans entirely against its local IndexedDB copy and only contacts `/api/excel` when there is connectivity. Devices are gated by a short access code, typed once on the Start screen and stored locally; it never affects offline scanning.
 
-Auth is **app-only** (client credentials) against a work/school tenant. The app registration is itself the identity: no user signs in, there is no refresh token to rotate, and nothing breaks when a person leaves or changes their password.
+Auth is **delegated** — the app acts as you. You sign in once from a laptop, and the server keeps the resulting token and reuses it. Nothing is granted that you couldn't already open yourself, which is why **no admin consent is required**. (App-only auth would give the app its own tenant-wide identity, and that does need an administrator.)
+
+Two consequences worth knowing up front: every write appears in the workbook's version history under **your** name, and the connection stops working if your account is disabled. Re-connecting is one visit to `/api/auth/start`.
 
 ### Entra app registration
 
-1. Entra admin centre → App registrations → New registration. Supported account types: **this organizational directory only**. No redirect URI is needed — there is no browser sign-in.
-2. Certificates & secrets → New client secret. Note the expiry; the app returns a distinct "lost access" error when it lapses, but a calendar reminder is cheaper.
-3. API permissions → Microsoft Graph → **Application** permissions → then see below.
-4. Grant admin consent.
+1. Entra portal → App registrations → New registration.
+   - Supported account types: **accounts in this organizational directory only**.
+   - Redirect URI: **Web** → `https://<your-app>.vercel.app/api/auth/callback`
+2. Certificates & secrets → New client secret → copy the **Value** (shown once). Note its expiry — the app reports a distinct "sign in again" error when it lapses, but a calendar reminder is cheaper.
+3. API permissions → Microsoft Graph → **Delegated** permissions → add **`Files.ReadWrite.All`** and **`offline_access`**.
 
-**On permissions:** `Files.ReadWrite.All` grants read/write to *every* file in the tenant, and an admin is right to push back on that. Prefer least privilege:
+Delegated `Files.ReadWrite.All` reads and writes only what your own account can already reach, across both OneDrive for Business and any SharePoint library you have access to. Despite the name it does **not** require admin consent — unlike the *application* permission of the same name. `offline_access` is what makes the refresh token possible; without it the connection would die within the hour.
 
-- **Workbook in a SharePoint / Teams document library** → use **`Sites.Selected`**, then have an admin grant this one app write access to that one site. This is the recommended setup; if the workbook is currently in someone's OneDrive, moving it to a Teams site is worth doing for this reason alone.
-- **Workbook in OneDrive for Business** → `Files.ReadWrite.All` is the only option, since `Sites.Selected` doesn't cover personal drives.
+If your tenant blocks self-service app registration, this is the one thing you'll need IT for — and it's a far smaller ask than tenant-wide application permissions.
 
-### Finding the two ids
+### Finding the ids
 
-App-only tokens have no `/me`, so the drive must be named explicitly. Run these in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer) while signed in as yourself:
+Run these in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer) signed in as yourself:
 
 ```http
-# SharePoint / Teams library
-GET /sites/{hostname}:/sites/{site-name}
-GET /sites/{site-id}/drives                       → EXCEL_DRIVE_ID
+# Workbook in your own OneDrive for Business — leave EXCEL_DRIVE_ID blank
+GET /me/drive/root/search(q='stock.xlsx')          → EXCEL_ITEM_ID
 
-# OneDrive for Business
-GET /me/drive                                     → EXCEL_DRIVE_ID
-
-# then, either way
+# Workbook in a SharePoint / Teams library
+GET /sites/{hostname}:/sites/{site-name}           → site id
+GET /sites/{site-id}/drives                        → EXCEL_DRIVE_ID
 GET /drives/{drive-id}/root/search(q='stock.xlsx') → EXCEL_ITEM_ID
 ```
+
+### Connecting
+
+After the env vars are set and deployed, visit once from a laptop:
+
+```
+https://<your-app>.vercel.app/api/auth/start?code=<STOCKTAKE_ACCESS_CODE>
+```
+
+Sign in, accept the consent prompt, and you should see "Excel connected". The refresh token is stored in KV and rotated automatically on every use — which is why a KV store is needed rather than an env var. Vercel env vars aren't writable at runtime.
 
 ## Excel workbook structure
 
@@ -117,8 +127,10 @@ To exercise `/api/excel` locally you need `vercel dev` (plain `vite` does not ru
 
 1. Push to a **private** GitHub repo. `.gitignore` already excludes `node_modules/`, `dist/`, and every `.env` except the example.
 2. Import the repo in Vercel — the Vite preset is detected automatically, and `api/*.ts` becomes Node functions with no extra config.
-3. Set the server env vars from `.env.example` for **Production and Preview**: `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `EXCEL_DRIVE_ID`, `EXCEL_ITEM_ID`, `STOCKTAKE_ACCESS_CODE`.
-4. Vercel serves HTTPS by default — mandatory, since both the camera and the service worker require it.
+3. Add **Upstash Redis** from the Vercel Marketplace (Storage tab). It injects `KV_REST_API_URL` and `KV_REST_API_TOKEN` automatically — that's where the refresh token lives.
+4. Set the remaining server env vars from `.env.example` for **Production and Preview** both: `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `EXCEL_ITEM_ID`, `STOCKTAKE_ACCESS_CODE`, plus `EXCEL_DRIVE_ID` / `MS_TENANT_ID` if you need them.
+5. Register `https://<your-app>.vercel.app/api/auth/callback` as a redirect URI on the Entra app, then visit `/api/auth/start?code=…` once from a laptop to connect.
+6. Vercel serves HTTPS by default — mandatory, since both the camera and the service worker require it.
 
 `vercel.json` keeps `sw.js` and the manifest revalidating so `registerType: 'autoUpdate'` actually picks up new deploys; hashed assets keep Vercel's immutable caching.
 
