@@ -64,6 +64,23 @@ small { color: var(--ink-dim); }
 .btn-quiet { background: transparent; border: 1px solid var(--line); color: var(--ink); }
 .btn-danger { background: var(--bad); }
 .register-state { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.register-state code { font-family: var(--mono); color: var(--ink); }
+.scope-row-wide { grid-template-columns: 1fr auto; }
+
+.account-card { flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
+.account-name { font-weight: 700; }
+
+/* Workbook picker: a tap target per file, sized for a thumb, not a mouse. */
+.picker { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.picker button {
+  width: 100%; text-align: left; background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px; min-height: 48px; font-size: 15px;
+}
+.picker button:disabled { opacity: 0.5; }
+.picker small { color: var(--ink-dim); font-size: 12px; word-break: break-all; }
+.picker-empty { color: var(--ink-dim); font-size: 14px; padding: 8px 2px; }
+.busy { color: var(--info); margin: 0; }
 
 /* scan screen */
 .scan-screen { padding-bottom: 20px; }

@@ -5,11 +5,13 @@ function num(v: string | undefined, fallback: number): number {
 
 export const config = {
   /**
-   * Relative by design. The Vercel function at this path is the only thing that
-   * holds Microsoft credentials — nothing secret is ever built into this bundle,
-   * because anything prefixed VITE_ is inlined into public JavaScript.
+   * Entra application (client) id. Public by design: a public client holds no
+   * secret and proves itself with PKCE, so this identifies the app rather than
+   * authorising it. Safe to ship in the bundle.
    */
-  apiUrl: '/api/excel',
+  msClientId: (import.meta.env.VITE_MS_CLIENT_ID as string) ?? '',
+  /** Optional. Blank accepts any work/school account; set to pin one tenant. */
+  msTenantId: (import.meta.env.VITE_MS_TENANT_ID as string) ?? '',
   syncIntervalMs: num(import.meta.env.VITE_SYNC_INTERVAL_MS, 30_000),
   syncBatchSize: num(import.meta.env.VITE_SYNC_BATCH_SIZE, 50),
   /** Suppress re-detection of the same tag while it sits in frame. */

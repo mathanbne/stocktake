@@ -1,4 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import type { WorkbookRef } from './graph';
 import type { PendingClose, RegisterAsset, ScanRecord, Session } from './types';
 
 interface StocktakeDB extends DBSchema {
@@ -98,22 +99,22 @@ export async function registerFetchedAt(): Promise<string | null> {
   return (row?.value as string) ?? null;
 }
 
-// ---- access code ----
+// ---- chosen workbook ----
 
 /**
- * Entered once per device and kept locally. It gates the Vercel function, not
- * the app: scanning offline never touches it, so a wrong code can't strand a
- * scanner mid-session — only the sync will complain.
+ * Picked once per device and remembered, so a scanner isn't asked to find the
+ * file again every shift. Stored locally rather than derived, because the app
+ * must know its target without a network round trip.
  */
-export async function getAccessCode(): Promise<string> {
+export async function getWorkbook(): Promise<WorkbookRef | null> {
   const db = await getDB();
-  const row = await db.get('meta', 'accessCode');
-  return (row?.value as string) ?? '';
+  const row = await db.get('meta', 'workbook');
+  return (row?.value as WorkbookRef) ?? null;
 }
 
-export async function setAccessCode(code: string): Promise<void> {
+export async function setWorkbook(wb: WorkbookRef): Promise<void> {
   const db = await getDB();
-  await guarded(() => db.put('meta', { key: 'accessCode', value: code }).then(() => undefined));
+  await guarded(() => db.put('meta', { key: 'workbook', value: wb }).then(() => undefined));
 }
 
 // ---- sessions ----

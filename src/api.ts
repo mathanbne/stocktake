@@ -1,59 +1,20 @@
-import { config } from './config';
-import { getAccessCode } from './db';
+import { NotSignedInError } from './auth';
+import { getWorkbook } from './db';
+import { appendScans, applyClose, getRegisterRows } from './graph';
 import type { PendingClose, RegisterAsset, RegisterRowWire, ScanRecord } from './types';
 
-/** Thrown when the server rejects the device access code — actionable, unlike a 500. */
-export class AccessDeniedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AccessDeniedError';
-  }
-}
-
-/**
- * The server's app registration has lost access — an expired client secret or
- * withdrawn admin consent. Retrying will not help; an admin has to act.
- */
-export class ReauthRequiredError extends Error {
+/** No workbook has been chosen on this device yet. */
+export class NoWorkbookError extends Error {
   constructor() {
-    super("The Excel connection has lost access. Scans are safe — ask IT to check the app registration.");
-    this.name = 'ReauthRequiredError';
+    super('Choose the stocktake workbook before syncing.');
+    this.name = 'NoWorkbookError';
   }
 }
 
-async function callApi<T>(body: unknown): Promise<T> {
-  const res = await fetch(config.apiUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-stocktake-code': await getAccessCode(),
-    },
-    body: JSON.stringify(body),
-  });
-
-  // Read as text first. A crashed function returns Vercel's HTML error page, not
-  // JSON, and blindly calling .json() would swallow the only clue we have.
-  const raw = await res.text();
-  let parsed: { error?: string } = {};
-  try {
-    parsed = raw ? JSON.parse(raw) : {};
-  } catch {
-    parsed = {};
-  }
-
-  if (!res.ok) {
-    if (res.status === 401 && parsed.error === 'reauth_required') throw new ReauthRequiredError();
-    if (res.status === 401 || res.status === 403) {
-      throw new AccessDeniedError('Access code rejected. Check the code and try again.');
-    }
-    const detail =
-      parsed.error ??
-      (raw.trim() === ''
-        ? 'empty response — the function crashed. Check the Vercel function logs.'
-        : `${raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)}`);
-    throw new Error(`${res.status}: ${detail}`);
-  }
-  return parsed as T;
+async function workbook() {
+  const wb = await getWorkbook();
+  if (!wb) throw new NoWorkbookError();
+  return wb;
 }
 
 function str(v: unknown): string {
@@ -91,27 +52,16 @@ export function mapRegisterRows(rows: RegisterRowWire[]): RegisterAsset[] {
 }
 
 export async function fetchRegister(): Promise<RegisterAsset[]> {
-  const { rows } = await callApi<{ rows: RegisterRowWire[] }>({ action: 'getRegister' });
-  return mapRegisterRows(rows);
+  const rows = await getRegisterRows(await workbook());
+  return mapRegisterRows(rows as unknown as RegisterRowWire[]);
 }
 
 export async function submitScans(scans: ScanRecord[]): Promise<void> {
-  await callApi({
-    action: 'submitScans',
-    scans: scans.map((s) => ({
-      sessionId: s.sessionId,
-      scanId: s.scanId,
-      assetId: s.assetId,
-      scannedValue: s.scannedValue,
-      result: s.result,
-      scannedBy: s.scannedBy,
-      timestamp: s.timestamp,
-      actualLocation: s.actualLocation,
-      notes: s.notes,
-    })),
-  });
+  await appendScans(await workbook(), scans);
 }
 
 export async function submitClose(pc: PendingClose): Promise<void> {
-  await callApi({ action: 'closeSession', ...pc });
+  await applyClose(await workbook(), pc);
 }
+
+export { NotSignedInError };

@@ -1,59 +1,35 @@
 # Asset Stocktake PWA
 
-Offline-first stocktake app. Scans 1D barcodes, classifies each scan instantly against a locally cached register, persists every scan to IndexedDB at capture, and syncs batches to a Vercel function that owns all Excel Online writes. "Missing" is derived only at session close, behind a preview and explicit confirmation.
+Offline-first stocktake app. Scans 1D barcodes, classifies each scan instantly against a locally cached register, persists every scan to IndexedDB at capture, and writes results to a workbook in Excel Online. "Missing" is derived only at session close, behind a preview and explicit confirmation.
 
-The phone never authenticates to Microsoft and never holds a credential.
+## How it works
 
-## How access to Excel Online works
+1. Open the app, **sign in with your work Microsoft account**
+2. **Pick the stocktake workbook** — searches your OneDrive and any SharePoint site you can open
+3. **Download the register** once, then scan — online or off
+
+There is no server and no shared secret. The app is a static site that talks to Microsoft Graph directly as the signed-in user, so each scanner reaches exactly the files they already have access to, and every write is attributed to them in the workbook's version history.
 
 ```
-mobile browser  ──▶  /api/excel  (Vercel Function)  ──▶  Microsoft Graph  ──▶  stock.xlsx
-   no secrets            credentials live here                                Excel Online
+phone  ──sign in──▶  Microsoft identity
+   │
+   └──Graph──▶  your workbook in Excel Online
 ```
 
-This is the only shape that works for a browser-launched scanner. Anything a Vite client can read (`VITE_*`) is inlined into public JavaScript, so a flow URL or API key placed there is readable by anyone who opens the site. And a sign-in on the phone would break the core promise — a token that needs refreshing over the network can't gate a scanner in airplane mode.
-
-So the app scans entirely against its local IndexedDB copy and only contacts `/api/excel` when there is connectivity. Devices are gated by a short access code, typed once on the Start screen and stored locally; it never affects offline scanning.
-
-Auth is **delegated** — the app acts as you. You sign in once from a laptop, and the server keeps the resulting token and reuses it. Nothing is granted that you couldn't already open yourself, which is why **no admin consent is required**. (App-only auth would give the app its own tenant-wide identity, and that does need an administrator.)
-
-Two consequences worth knowing up front: every write appears in the workbook's version history under **your** name, and the connection stops working if your account is disabled. Re-connecting is one visit to `/api/auth/start`.
+Scanning never waits on the network. The register is cached in IndexedDB, every scan is written to disk before the verdict appears on screen, and the upload queue drains whenever a connection is available.
 
 ### Entra app registration
 
-1. Entra portal → App registrations → New registration.
-   - Supported account types: **accounts in this organizational directory only**.
-   - Redirect URI: **Web** → `https://<your-app>.vercel.app/api/auth/callback`
-2. Certificates & secrets → New client secret → copy the **Value** (shown once). Note its expiry — the app reports a distinct "sign in again" error when it lapses, but a calendar reminder is cheaper.
-3. API permissions → Microsoft Graph → **Delegated** permissions → add **`Files.ReadWrite.All`** and **`offline_access`**.
+The one piece of setup. A **public client** — a client id, no secret, no admin consent.
 
-Delegated `Files.ReadWrite.All` reads and writes only what your own account can already reach, across both OneDrive for Business and any SharePoint library you have access to. Despite the name it does **not** require admin consent — unlike the *application* permission of the same name. `offline_access` is what makes the refresh token possible; without it the connection would die within the hour.
+1. [entra.microsoft.com](https://entra.microsoft.com) → App registrations → New registration
+   - Supported account types: **accounts in this organizational directory only**
+   - Redirect URI: **Single-page application (SPA)** → `https://<your-app>.vercel.app`
+     Add `http://localhost:5173` too if you want to run it locally.
+2. Copy the **Application (client) ID** → that's `VITE_MS_CLIENT_ID`
+3. API permissions → Microsoft Graph → **Delegated** → add `Files.ReadWrite.All` and `User.Read`
 
-If your tenant blocks self-service app registration, this is the one thing you'll need IT for — and it's a far smaller ask than tenant-wide application permissions.
-
-### Finding the ids
-
-Run these in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer) signed in as yourself:
-
-```http
-# Workbook in your own OneDrive for Business — leave EXCEL_DRIVE_ID blank
-GET /me/drive/root/search(q='stock.xlsx')          → EXCEL_ITEM_ID
-
-# Workbook in a SharePoint / Teams library
-GET /sites/{hostname}:/sites/{site-name}           → site id
-GET /sites/{site-id}/drives                        → EXCEL_DRIVE_ID
-GET /drives/{drive-id}/root/search(q='stock.xlsx') → EXCEL_ITEM_ID
-```
-
-### Connecting
-
-After the env vars are set and deployed, visit once from a laptop:
-
-```
-https://<your-app>.vercel.app/api/auth/start?code=<STOCKTAKE_ACCESS_CODE>
-```
-
-Sign in, accept the consent prompt, and you should see "Excel connected". The refresh token is stored in KV and rotated automatically on every use — which is why a KV store is needed rather than an env var. Vercel env vars aren't writable at runtime.
+The client id ships in public JavaScript, and that is fine — it identifies the app rather than authorising it. A public client holds no secret and proves itself with PKCE; the user's own sign-in is what grants access. Delegated `Files.ReadWrite.All` reaches only what the signed-in user can already open, and unlike the *application* permission of the same name it needs **no admin consent**.
 
 ## Excel workbook structure
 
@@ -82,7 +58,7 @@ The three added columns must be **adjacent**; they are written as a single range
 
 There is no "Expected Location" column. The app derives one as `Facility Group / Facility` (→ `A BLOCK / 01G04`) and scope-matches it as a case-insensitive substring, so a session scoped to `A BLOCK` covers the whole block and one scoped to `01G04` covers the single room — with no extra column to maintain.
 
-**Table `ScanLog`** (sheet "ScanLog") — append-only; the server only ever adds rows.
+**Table `ScanLog`** (sheet "ScanLog") — append-only.
 
 | Column header | Type |
 |---|---|
@@ -104,9 +80,11 @@ There is no "Expected Location" column. The app derives one as `Facility Group /
 4. Rename sheet `Sheet1` → `Register`.
 5. Add sheet `ScanLog` with the headers above, also formatted as a table named **`ScanLog`**.
 
+The app checks for both tables when you pick a file, so a wrongly-shaped workbook is rejected at setup rather than mid-stocktake.
+
 ### Tag matching
 
-A scan is matched against `Barcode` → `Asset Id` → `Serial Number` → `Old Asset Id`, in that order, so it resolves whichever value the physical label actually encodes and tolerates a partly-populated `Barcode` column. Aliases are resolved to a single `Asset Id`, so the same asset read twice by different columns is still one sighting.
+A scan is matched against `Barcode` → `Asset Id` → `Serial Number` → `Old Asset Id`, in that order, so it resolves whichever value the physical label actually encodes and tolerates a partly-populated `Barcode` column. Aliases resolve to a single `Asset Id`, so the same asset read twice by different columns is still one sighting.
 
 Both sides are normalised the same way — whitespace removed, leading `#` and `'` stripped, uppercased — so the register's `#9339100142` matches a scan of `9339100142` and vice versa.
 
@@ -114,35 +92,44 @@ Both sides are normalised the same way — whitespace removed, leading `#` and `
 
 ```bash
 npm install
-cp .env.example .env
-npm run dev             # local dev (camera works on localhost)
+cp .env.example .env    # then fill in VITE_MS_CLIENT_ID
+npm run dev             # camera and sign-in both work on localhost
 npm run build           # production build in dist/
 ```
 
-`.env` holds client tuning knobs only (`VITE_SYNC_INTERVAL_MS`, `VITE_SYNC_BATCH_SIZE`, `VITE_SCAN_COOLDOWN_MS`). Every credential is a server-side variable set in the Vercel dashboard — see `.env.example` for the full list.
-
-To exercise `/api/excel` locally you need `vercel dev` (plain `vite` does not run the functions).
+Every variable is a `VITE_*` client value. There are no secrets to manage.
 
 ## Deploying
 
-1. Push to a **private** GitHub repo. `.gitignore` already excludes `node_modules/`, `dist/`, and every `.env` except the example.
-2. Import the repo in Vercel — the Vite preset is detected automatically, and `api/*.ts` becomes Node functions with no extra config.
-3. Add **Upstash Redis** from the Vercel Marketplace (Storage tab). It injects `KV_REST_API_URL` and `KV_REST_API_TOKEN` automatically — that's where the refresh token lives.
-4. Set the remaining server env vars from `.env.example` for **Production and Preview** both: `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `EXCEL_ITEM_ID`, `STOCKTAKE_ACCESS_CODE`, plus `EXCEL_DRIVE_ID` / `MS_TENANT_ID` if you need them.
-5. Register `https://<your-app>.vercel.app/api/auth/callback` as a redirect URI on the Entra app, then visit `/api/auth/start?code=…` once from a laptop to connect.
-6. Vercel serves HTTPS by default — mandatory, since both the camera and the service worker require it.
+1. Push to GitHub.
+2. Import the repo in Vercel — the Vite preset is detected automatically. It's a purely static build; there are no serverless functions.
+3. Set `VITE_MS_CLIENT_ID` (and optionally `VITE_MS_TENANT_ID`) for **Production and Preview**. Vite inlines these at build time, so a change needs a redeploy, not just a restart.
+4. Add the deployed origin as a **SPA redirect URI** on the app registration.
+5. Vercel serves HTTPS by default — mandatory, since the camera, service worker and MSAL all require it.
 
-`vercel.json` keeps `sw.js` and the manifest revalidating so `registerType: 'autoUpdate'` actually picks up new deploys; hashed assets keep Vercel's immutable caching.
+`vercel.json` keeps `sw.js` and the manifest revalidating so `registerType: 'autoUpdate'` picks up new deploys; hashed assets keep Vercel's immutable caching.
 
-First run on a phone: open the URL, enter the access code, tap "Download register" once while connected, then Add to Home Screen. After that the app launches and scans with zero connectivity.
+First run on a phone: open the URL, sign in, pick the workbook, tap "Download register", then Add to Home Screen. After that the app launches and scans with zero connectivity.
+
+## Sign-in and offline
+
+Tokens are cached in `localStorage`, so a scanner stays signed in between shifts. Refreshing a token needs a network connection — but so does syncing, so this never blocks scanning. Offline, the app classifies against the cached register and queues scans; when the connection returns, the queue drains.
+
+If sign-in has genuinely lapsed, MSAL redirects to Microsoft to re-authenticate. Nothing captured is lost: scans live in IndexedDB until the workbook confirms them. A session that is already open stays reachable even when signed out, so captured work is never stranded behind a login.
 
 ## Idempotency
 
-Every scan carries a client-generated `Scan ID`. `submitScans` reads the existing IDs before appending, so a lost response costs nothing — the identical batch is re-sent and every already-logged row is skipped. The client marks a batch synced only on a 200.
+Every scan carries a client-generated `Scan ID`. Uploads read the existing IDs before appending, so a lost response costs nothing — the identical batch is re-sent and every already-logged row is skipped.
 
-`closeSession` writes register cells by range, keyed on `Asset Id`, which makes a replay a no-op rewrite of the same values. If the close fails partway, the session stays in `closing`, the exact payload stays on disk, and the sync loop replays it — automatically, including after a reboot.
+Closing a session writes register cells by range, keyed on `Asset Id`, which makes a replay a no-op rewrite of the same values. If a close fails partway, the session stays in `closing`, the exact payload stays on disk, and the sync loop replays it — automatically, including after a reboot.
 
 ## Test checklist
+
+**Sign-in and workbook**
+- [ ] First launch shows "Sign in with Microsoft"; after signing in, your name appears.
+- [ ] Search finds `stock.xlsx`; picking it stores the choice and survives an app restart.
+- [ ] Picking a workbook *without* the two tables is rejected with a clear message, not accepted.
+- [ ] Sign out, then relaunch → back to the sign-in screen, with any open session still resumable.
 
 **Instant feedback**
 - [ ] With airplane mode ON, scan a known tag: verdict flash renders immediately (no spinner, no delay).
@@ -155,7 +142,7 @@ Every scan carries a client-generated `Scan ID`. `submitScans` reads the existin
 **Tag matching**
 - [ ] A register value of `#9339100142` matches a scan of `9339100142`, and the reverse.
 - [ ] An asset with an empty `Barcode` still resolves via `Asset Id`.
-- [ ] Reading one asset by barcode and then by serial counts as one sighting, second read ALREADY SCANNED.
+- [ ] Reading one asset by barcode and then by serial counts as one sighting; the second is ALREADY SCANNED.
 
 **Durable capture**
 - [ ] Scan 5 tags in airplane mode, force-quit the browser from the app switcher, relaunch → resume prompt shows all 5.
@@ -168,8 +155,8 @@ Every scan carries a client-generated `Scan ID`. `submitScans` reads the existin
 
 **Batched, idempotent sync**
 - [ ] Scan 10 tags offline; go online → header counts down to "Synced"; ScanLog has exactly 10 new rows, in capture order.
-- [ ] In DevTools, block `/api/excel` after the request is sent (simulate a lost response) → client retries; ScanLog has no duplicate Scan IDs.
-- [ ] Change `VITE_SYNC_INTERVAL_MS` and confirm the cadence changes without code edits.
+- [ ] In DevTools, block `graph.microsoft.com` after a request is sent → client retries; ScanLog has no duplicate Scan IDs.
+- [ ] Change `VITE_SYNC_INTERVAL_MS`, rebuild, and confirm the cadence changes.
 
 **Safe reconciliation**
 - [ ] Close a session with unscanned in-scope assets → preview lists each with Asset Id, name, expected location; nothing is written before Confirm.
@@ -188,9 +175,6 @@ Every scan carries a client-generated `Scan ID`. `submitScans` reads the existin
 - [ ] iOS Safari falls back to ZXing and still decodes Code 128/39 tags.
 - [ ] Deny camera permission → manual entry still works end to end.
 
-**Security**
-- [ ] `grep -rniE "client_secret|MS_CLIENT|MS_TENANT|EXCEL_DRIVE" dist/` returns nothing.
-- [ ] A request to `/api/excel` without a valid `x-stocktake-code` header returns 401.
-
 **Installability**
 - [ ] Install to home screen, enable airplane mode, launch from the icon → app opens and scans.
+- [ ] Sign-in redirect returns correctly into the installed app rather than a browser tab.
