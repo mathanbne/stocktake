@@ -1,0 +1,17 @@
+node_modules/
+dist/
+dist-ssr/
+.vercel
+
+# Secrets — never commit. .env.example carries the placeholders instead.
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+*.local
+.idea/
+.vscode/*
+!.vscode/extensions.json
